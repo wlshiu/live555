@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2013 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2015 Live Networks, Inc.  All rights reserved.
 // A subclass of "ServerMediaSession" that can be used to create a (unicast) RTSP servers that acts as a 'proxy' for
 // another (unicast or multicast) RTSP/RTP stream.
 // C++ header
@@ -46,6 +46,7 @@ public:
   void continueAfterDESCRIBE(char const* sdpDescription);
   void continueAfterLivenessCommand(int resultCode, Boolean serverSupportsGetParameter);
   void continueAfterSETUP();
+  void continueAfterPLAY(int resultCode);
 
 private:
   void reset();
@@ -75,6 +76,19 @@ private:
   TaskToken fLivenessCommandTask, fDESCRIBECommandTask, fSubsessionTimerTask;
 };
 
+
+typedef ProxyRTSPClient*
+createNewProxyRTSPClientFunc(ProxyServerMediaSession& ourServerMediaSession,
+			     char const* rtspURL,
+			     char const* username, char const* password,
+			     portNumBits tunnelOverHTTPPortNum, int verbosityLevel,
+			     int socketNumToServer);
+ProxyRTSPClient*
+defaultCreateNewProxyRTSPClientFunc(ProxyServerMediaSession& ourServerMediaSession,
+				    char const* rtspURL,
+				    char const* username, char const* password,
+				    portNumBits tunnelOverHTTPPortNum, int verbosityLevel,
+				    int socketNumToServer);
 
 class ProxyServerMediaSession: public ServerMediaSession {
 public:
@@ -106,12 +120,17 @@ protected:
   ProxyServerMediaSession(UsageEnvironment& env, RTSPServer* ourRTSPServer,
 			  char const* inputStreamURL, char const* streamName,
 			  char const* username, char const* password,
-			  portNumBits tunnelOverHTTPPortNum, int verbosityLevel, int socketNumToServer);
+			  portNumBits tunnelOverHTTPPortNum, int verbosityLevel,
+			  int socketNumToServer,
+			  createNewProxyRTSPClientFunc* ourCreateNewProxyRTSPClientFunc
+			  = defaultCreateNewProxyRTSPClientFunc);
 
-  // If you subclass "ProxyRTSPClient", then you should also subclass "ProxyServerMediaSession" and redefine this virtual function
-  // in order to create new objects of your "ProxyRTSPClient" subclass:
-  virtual ProxyRTSPClient* createNewProxyRTSPClient(char const* rtspURL, char const* username, char const* password,
-						    portNumBits tunnelOverHTTPPortNum, int verbosityLevel, int socketNumToServer);
+  // If you subclass "ProxyRTSPClient", then you will also need to define your own function
+  // - with signature "createNewProxyRTSPClientFunc" (see above) - that creates a new object
+  // of this subclass.  You should also subclass "ProxyServerMediaSession" and, in your
+  // subclass's constructor, initialize the parent class (i.e., "ProxyServerMediaSession")
+  // constructor by passing your new function as the "ourCreateNewProxyRTSPClientFunc"
+  // parameter.
 
 protected:
   RTSPServer* fOurRTSPServer;
@@ -127,6 +146,7 @@ private:
 private:
   int fVerbosityLevel;
   class PresentationTimeSessionNormalizer* fPresentationTimeSessionNormalizer;
+  createNewProxyRTSPClientFunc* fCreateNewProxyRTSPClientFunc;
 };
 
 

@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2013 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2015 Live Networks, Inc.  All rights reserved.
 // A data structure that represents a session that consists of
 // potentially multiple (audio and/or video) sub-sessions
 // (This data structure is used for media *streamers* - i.e., servers.
@@ -47,8 +47,6 @@ public:
 				       char const* description = NULL,
 				       Boolean isSSM = False,
 				       char const* miscSDPLines = NULL);
-
-  virtual ~ServerMediaSession();
 
   static Boolean lookupByName(UsageEnvironment& env,
                               char const* mediumName,
@@ -84,6 +82,8 @@ protected:
 		     char const* info, char const* description,
 		     Boolean isSSM, char const* miscSDPLines);
   // called only by "createNew()"
+
+  virtual ~ServerMediaSession();
 
 private: // redefined virtual functions
   virtual Boolean isServerMediaSession() const;
@@ -123,8 +123,6 @@ private:
 
 class ServerMediaSubsession: public Medium {
 public:
-  virtual ~ServerMediaSubsession();
-
   unsigned trackNumber() const { return fTrackNumber; }
   char const* trackId();
   virtual char const* sdpLines() = 0;
@@ -150,7 +148,8 @@ public:
 			   ServerRequestAlternativeByteHandler* serverRequestAlternativeByteHandler,
 			   void* serverRequestAlternativeByteHandlerClientData) = 0;
   virtual void pauseStream(unsigned clientSessionId, void* streamToken);
-  virtual void seekStream(unsigned clientSessionId, void* streamToken, double& seekNPT, double streamDuration, u_int64_t& numBytes);
+  virtual void seekStream(unsigned clientSessionId, void* streamToken, double& seekNPT,
+			  double streamDuration, u_int64_t& numBytes);
      // This routine is used to seek by relative (i.e., NPT) time.
      // "streamDuration", if >0.0, specifies how much data to stream, past "seekNPT".  (If <=0.0, all remaining data is streamed.)
      // "numBytes" returns the size (in bytes) of the data to be streamed, or 0 if unknown or unlimited.
@@ -159,7 +158,8 @@ public:
      // "absStart" should be a string of the form "YYYYMMDDTHHMMSSZ" or "YYYYMMDDTHHMMSS.<frac>Z".
      // "absEnd" should be either NULL (for no end time), or a string of the same form as "absStart".
      // These strings may be modified in-place, or can be reassigned to a newly-allocated value (after delete[]ing the original).
-  virtual void nullSeekStream(unsigned clientSessionId, void* streamToken);
+  virtual void nullSeekStream(unsigned clientSessionId, void* streamToken,
+			      double streamEndTime, u_int64_t& numBytes);
      // Called whenever we're handling a "PLAY" command without a specified start time.
   virtual void setStreamScale(unsigned clientSessionId, void* streamToken, float scale);
   virtual float getCurrentNPT(void* streamToken);
@@ -180,6 +180,7 @@ public:
 
 protected: // we're a virtual base class
   ServerMediaSubsession(UsageEnvironment& env);
+  virtual ~ServerMediaSubsession();
 
   char const* rangeSDPLine() const;
       // returns a string to be delete[]d

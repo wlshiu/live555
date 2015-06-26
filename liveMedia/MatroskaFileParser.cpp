@@ -14,7 +14,7 @@ along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
 // "liveMedia"
-// Copyright (c) 1996-2013 Live Networks, Inc.  All rights reserved.
+// Copyright (c) 1996-2015 Live Networks, Inc.  All rights reserved.
 // A parser for a Matroska file.
 // Implementation
 
@@ -31,7 +31,7 @@ MatroskaFileParser::MatroskaFileParser(MatroskaFile& ourFile, FramedSource* inpu
     fOnEndFunc(onEndFunc), fOnEndClientData(onEndClientData),
     fOurDemux(ourDemux),
     fCurOffsetInFile(0), fSavedCurOffsetInFile(0), fLimitOffsetInFile(0),
-    fClusterTimecode(0), fBlockTimecode(0),
+    fNumHeaderBytesToSkip(0), fClusterTimecode(0), fBlockTimecode(0),
     fFrameSizesWithinBlock(NULL),
     fPresentationTimeOffset(0.0) {
   if (ourDemux == NULL) {
@@ -100,7 +100,7 @@ void MatroskaFileParser::continueParsing() {
     }
   }
 
-  // We successfully parsed the file's 'Track' headers.  Call our 'done' function now:
+  // We successfully parsed the file.  Call our 'done' function now:
   if (fOnEndFunc != NULL) (*fOnEndFunc)(fOnEndClientData);
 }
 
@@ -108,6 +108,7 @@ Boolean MatroskaFileParser::parse() {
   Boolean areDone = False;
 
   try {
+    skipRemainingHeaderBytes(True); // if any
     do {
       switch (fCurrentParseState) {
         case PARSING_START_OF_FILE: {
@@ -185,12 +186,16 @@ Boolean MatroskaFileParser::parseStartOfFile() {
 
   // The file must begin with the standard EBML header (which we skip):
   if (!parseEBMLIdAndSize(id, size) || id != MATROSKA_ID_EBML) {
-    fOurFile.envir() << "ERROR: FIle does not begin with an EBML header\n";
+    fOurFile.envir() << "ERROR: File does not begin with an EBML header\n";
     return True; // We're done with the file, because it's not valid
   }
-  skipHeader(size);
+#ifdef DEBUG
+    fprintf(stderr, "MatroskaFileParser::parseStartOfFile(): Parsed id 0x%s (%s), size: %lld\n", id.hexString(), id.stringName(), size.val());
+#endif
 
   fCurrentParseState = LOOKING_FOR_TRACKS;
+  skipHeader(size);
+
   return False; // because we have more parsing to do - inside the 'Track' header
 }
 
@@ -266,6 +271,18 @@ void MatroskaFileParser::lookForNextTrack() {
 	}
 	break;
       }
+#ifdef DEBUG
+      case MATROSKA_ID_TITLE: { // 'Segment Title': display this value
+	char* title;
+	if (parseEBMLVal_string(size, title)) {
+#ifdef DEBUG
+	  fprintf(stderr, "\tTitle: %s\n", title);
+#endif
+	  delete[] title;
+	}
+	break;
+      }
+#endif
       case MATROSKA_ID_TRACKS: { // enter this, and move on to parsing 'Tracks'
 	fLimitOffsetInFile = fCurOffsetInFile + size.val(); // Make sure we don't read past the end of this header
 	fCurrentParseState = PARSING_TRACK;
@@ -273,9 +290,6 @@ void MatroskaFileParser::lookForNextTrack() {
       }
       default: { // skip over this header
 	skipHeader(size);
-#ifdef DEBUG
-	fprintf(stderr, "\tskipped %lld bytes\n", size.val());
-#endif
 	break;
       }
     }
@@ -312,7 +326,7 @@ Boolean MatroskaFileParser::parseTrack() {
 #endif
 	  if (track != NULL && trackNumber != 0) {
 	    track->trackNumber = trackNumber;
-	    fOurFile.fTracks.add(track, trackNumber);
+	    fOurFile.addTrack(track, trackNumber);
 	  }
 	}
 	break;
@@ -419,6 +433,32 @@ Boolean MatroskaFileParser::parseTrack() {
 #endif
 	  if (track != NULL) {
 	    delete[] track->codecID; track->codecID = codecID;
+
+	    // Also set the track's "mimeType" field, if we can deduce it from the "codecID":
+	    if (strncmp(codecID, "A_MPEG", 6) == 0) {
+	      track->mimeType = "audio/MPEG";
+	    } else if (strncmp(codecID, "A_AAC", 5) == 0) {
+	      track->mimeType = "audio/AAC";
+	    } else if (strncmp(codecID, "A_AC3", 5) == 0) {
+	      track->mimeType = "audio/AC3";
+	    } else if (strncmp(codecID, "A_VORBIS", 8) == 0) {
+	      track->mimeType = "audio/VORBIS";
+	    } else if (strcmp(codecID, "A_OPUS") == 0) {
+	      track->mimeType = "audio/OPUS";
+	      track->codecIsOpus = True;
+	    } else if (strcmp(codecID, "V_MPEG4/ISO/AVC") == 0) {
+	      track->mimeType = "video/H264";
+	    } else if (strcmp(codecID, "V_MPEGH/ISO/HEVC") == 0) {
+	      track->mimeType = "video/H265";
+	    } else if (strncmp(codecID, "V_VP8", 5) == 0) {
+	      track->mimeType = "video/VP8";
+	    } else if (strncmp(codecID, "V_VP9", 5) == 0) {
+	      track->mimeType = "video/VP9";
+	    } else if (strncmp(codecID, "V_THEORA", 8) == 0) {
+	      track->mimeType = "video/THEORA";
+	    } else if (strncmp(codecID, "S_TEXT", 6) == 0) {
+	      track->mimeType = "text/T140";
+	    }
 	  } else {
 	    delete[] codecID;
 	  }
@@ -438,6 +478,36 @@ Boolean MatroskaFileParser::parseTrack() {
 	  if (track != NULL) {
 	    delete[] track->codecPrivate; track->codecPrivate = codecPrivate;
 	    track->codecPrivateSize = codecPrivateSize;
+
+	    // Hack for H.264 and H.265: The 'codec private' data contains
+	    // the size of NAL unit lengths:
+	    if (track->codecID != NULL) {
+	      if (strcmp(track->codecID, "V_MPEG4/ISO/AVC") == 0) { // H.264
+		// Byte 4 of the 'codec private' data contains 'lengthSizeMinusOne':
+		if (codecPrivateSize >= 5) track->subframeSizeSize = (codecPrivate[4]&0x3) + 1;
+	      } else if (strcmp(track->codecID, "V_MPEGH/ISO/HEVC") == 0) { // H.265
+		// H.265 'codec private' data is *supposed* to use the format that's described in
+		// http://lists.matroska.org/pipermail/matroska-devel/2013-September/004567.html
+		// However, some Matroska files use the same format that was used for H.264.
+		// We check for this here, by checking various fields that are supposed to be
+		// 'all-1' in the 'correct' format:
+		if (codecPrivateSize < 23 || (codecPrivate[13]&0xF0) != 0xF0 ||
+		    (codecPrivate[15]&0xFC) != 0xFC || (codecPrivate[16]&0xFC) != 0xFC ||
+		    (codecPrivate[17]&0xF8) != 0xF8 || (codecPrivate[18]&0xF8) != 0xF8) {
+		  // The 'correct' format isn't being used, so assume the H.264 format instead:
+		  track->codecPrivateUsesH264FormatForH265 = True;
+		  
+		  // Byte 4 of the 'codec private' data contains 'lengthSizeMinusOne':
+		  if (codecPrivateSize >= 5) track->subframeSizeSize = (codecPrivate[4]&0x3) + 1;
+		} else {
+		  // This looks like the 'correct' format:
+		  track->codecPrivateUsesH264FormatForH265 = False;
+
+		  // Byte 21 of the 'codec private' data contains 'lengthSizeMinusOne':
+		  track->subframeSizeSize = (codecPrivate[21]&0x3) + 1;
+		}
+	      }
+	    }
 	  } else {
 	    delete[] codecPrivate;
 	  }
@@ -583,9 +653,6 @@ Boolean MatroskaFileParser::parseTrack() {
       }
       default: { // We don't process this header, so just skip over it:
 	skipHeader(size);
-#ifdef DEBUG
-	fprintf(stderr, "\tskipped %lld bytes\n", size.val());
-#endif
 	break;
       }
     }
@@ -644,11 +711,56 @@ void MatroskaFileParser::lookForNextBlock() {
 	}
 	break;
       }
+      // Attachments are parsed only if we're in DEBUG mode (otherwise we just skip over them):
+#ifdef DEBUG
+      case MATROSKA_ID_ATTACHMENTS: { // 'Attachments': enter this
+	break;
+      }
+      case MATROSKA_ID_ATTACHED_FILE: { // 'Attached File': enter this
+	break;
+      }
+      case MATROSKA_ID_FILE_DESCRIPTION: { // 'File Description': get this value
+	char* fileDescription;
+	if (parseEBMLVal_string(size, fileDescription)) {
+#ifdef DEBUG
+	  fprintf(stderr, "\tFile Description: %s\n", fileDescription);
+#endif
+	  delete[] fileDescription;
+	}
+	break;
+      }
+      case MATROSKA_ID_FILE_NAME: { // 'File Name': get this value
+	char* fileName;
+	if (parseEBMLVal_string(size, fileName)) {
+#ifdef DEBUG
+	  fprintf(stderr, "\tFile Name: %s\n", fileName);
+#endif
+	  delete[] fileName;
+	}
+	break;
+      }
+      case MATROSKA_ID_FILE_MIME_TYPE: { // 'File MIME Type': get this value
+	char* fileMIMEType;
+	if (parseEBMLVal_string(size, fileMIMEType)) {
+#ifdef DEBUG
+	  fprintf(stderr, "\tFile MIME Type: %s\n", fileMIMEType);
+#endif
+	  delete[] fileMIMEType;
+	}
+	break;
+      }
+      case MATROSKA_ID_FILE_UID: { // 'File UID': get this value
+	unsigned fileUID;
+	if (parseEBMLVal_unsigned(size, fileUID)) {
+#ifdef DEBUG
+	  fprintf(stderr, "\tFile UID: 0x%x\n", fileUID);
+#endif
+	}
+	break;
+      }
+#endif
       default: { // skip over this header
 	skipHeader(size);
-#ifdef DEBUG
-	fprintf(stderr, "\tskipped %lld bytes\n", size.val());
-#endif
 	break;
       }
     }
@@ -727,9 +839,6 @@ Boolean MatroskaFileParser::parseCues() {
       }
       default: { // We don't process this header, so just skip over it:
 	skipHeader(size);
-#ifdef DEBUG_CUES
-	fprintf(stderr, "\tskipped %lld bytes\n", size.val());
-#endif
 	break;
       }
     }
@@ -907,22 +1016,40 @@ Boolean MatroskaFileParser::deliverFrameWithinBlock() {
       return False;
     }
 
-    unsigned frameSize = fFrameSizesWithinBlock[fNextFrameNumberToDeliver];
-    if (track->haveSubframes()) {
-      // The next "track->subframeSizeSize" bytes contain the length of a 'subframe':
-      if (fCurOffsetWithinFrame + track->subframeSizeSize > frameSize) break; // sanity check
-      unsigned subframeSize = 0;
-      for (unsigned i = 0; i < track->subframeSizeSize; ++i) {
-	u_int8_t c;
-	getCommonFrameBytes(track, &c, 1, 0);
-	if (fCurFrameNumBytesToGet > 0) { // it'll be 1
-	  c = get1Byte();
-	  ++fCurOffsetWithinFrame;
-	}
-	subframeSize = subframeSize*256 + c;
+    unsigned frameSize;
+    u_int8_t const* specialFrameSource = NULL;
+    u_int8_t const opusCommentHeader[16]
+      = {'O','p','u','s','T','a','g','s', 0, 0, 0, 0, 0, 0, 0, 0};
+    if (track->codecIsOpus && demuxedTrack->fOpusTrackNumber < 2) {
+      // Special case for Opus audio.  The first frame (the 'configuration' header) comes from
+      // the 'private data'.  The second frame (the 'comment' header) comes is synthesized by
+      // us here:
+      if (demuxedTrack->fOpusTrackNumber == 0) {
+	specialFrameSource = track->codecPrivate;
+	frameSize = track->codecPrivateSize;
+      } else { // demuxedTrack->fOpusTrackNumber == 1
+	specialFrameSource = opusCommentHeader;
+	frameSize = sizeof opusCommentHeader;
       }
-      if (subframeSize == 0 || fCurOffsetWithinFrame + subframeSize > frameSize) break; // sanity check
-      frameSize = subframeSize;
+      ++demuxedTrack->fOpusTrackNumber;
+    } else {
+      frameSize = fFrameSizesWithinBlock[fNextFrameNumberToDeliver];
+      if (track->haveSubframes()) {
+	// The next "track->subframeSizeSize" bytes contain the length of a 'subframe':
+	if (fCurOffsetWithinFrame + track->subframeSizeSize > frameSize) break; // sanity check
+	unsigned subframeSize = 0;
+	for (unsigned i = 0; i < track->subframeSizeSize; ++i) {
+	  u_int8_t c;
+	  getCommonFrameBytes(track, &c, 1, 0);
+	  if (fCurFrameNumBytesToGet > 0) { // it'll be 1
+	    c = get1Byte();
+	    ++fCurOffsetWithinFrame;
+	  }
+	  subframeSize = subframeSize*256 + c;
+	}
+	if (subframeSize == 0 || fCurOffsetWithinFrame + subframeSize > frameSize) break; // sanity check
+	frameSize = subframeSize;
+      }
     }
 
     // Compute the presentation time of this frame (from the cluster timecode, the block timecode, and the default duration):
@@ -940,12 +1067,17 @@ Boolean MatroskaFileParser::deliverFrameWithinBlock() {
     struct timeval presentationTime;
     presentationTime.tv_sec = (unsigned)pt;
     presentationTime.tv_usec = (unsigned)((pt - presentationTime.tv_sec)*1000000);
-    unsigned durationInMicroseconds = track->defaultDuration/1000;
-    if (track->haveSubframes()) {
-      // If this is a 'subframe', use a duration of 0 instead (unless it's the last 'subframe'):
-      if (fCurOffsetWithinFrame + frameSize + track->subframeSizeSize < fFrameSizesWithinBlock[fNextFrameNumberToDeliver]) {
-	// There's room for at least one more subframe after this, so give this subframe a duration of 0
-	durationInMicroseconds = 0;
+    unsigned durationInMicroseconds;
+    if (specialFrameSource != NULL) {
+      durationInMicroseconds = 0;
+    } else { // normal case
+      durationInMicroseconds = track->defaultDuration/1000;
+      if (track->haveSubframes()) {
+	// If this is a 'subframe', use a duration of 0 instead (unless it's the last 'subframe'):
+	if (fCurOffsetWithinFrame + frameSize + track->subframeSizeSize < fFrameSizesWithinBlock[fNextFrameNumberToDeliver]) {
+	  // There's room for at least one more subframe after this, so give this subframe a duration of 0
+	  durationInMicroseconds = 0;
+	}
       }
     }
 
@@ -986,8 +1118,19 @@ Boolean MatroskaFileParser::deliverFrameWithinBlock() {
     getCommonFrameBytes(track, demuxedTrack->to(), demuxedTrack->frameSize(), demuxedTrack->numTruncatedBytes());
 
     // Next, deliver (and/or skip) bytes from the input file:
-    fCurrentParseState = DELIVERING_FRAME_BYTES;
-    setParseState();
+    if (specialFrameSource != NULL) {
+      memmove(demuxedTrack->to(), specialFrameSource, demuxedTrack->frameSize());
+#ifdef DEBUG
+      fprintf(stderr, "\tdelivered special frame: %d bytes", demuxedTrack->frameSize());
+      if (demuxedTrack->numTruncatedBytes() > 0) fprintf(stderr, " (%d bytes truncated)", demuxedTrack->numTruncatedBytes());
+      fprintf(stderr, " @%u.%06u (%.06f from start); duration %u us\n", demuxedTrack->presentationTime().tv_sec, demuxedTrack->presentationTime().tv_usec, demuxedTrack->presentationTime().tv_sec+demuxedTrack->presentationTime().tv_usec/1000000.0-fPresentationTimeOffset, demuxedTrack->durationInMicroseconds());
+#endif
+      setParseState();
+      FramedSource::afterGetting(demuxedTrack); // completes delivery
+    } else { // normal case
+      fCurrentParseState = DELIVERING_FRAME_BYTES;
+      setParseState();
+    }
     return True;
   } while (0);
 
@@ -1225,17 +1368,37 @@ Boolean MatroskaFileParser::parseEBMLVal_binary(EBMLDataSize& size, u_int8_t*& r
 }
 
 void MatroskaFileParser::skipHeader(EBMLDataSize const& size) {
-  unsigned sv = (unsigned)size.val();
+  u_int64_t sv = (unsigned)size.val();
+#ifdef DEBUG
+  fprintf(stderr, "\tskipping %llu bytes\n", sv);
+#endif
 
-  // Hack: To avoid tripping into a parser 'internal error' if we try to skip an excessively large distance.
-  // (Such large distances are likely caused by erroneous data.  We might not be able to recover from this, but at least we won't
-  //  generate a parser 'internal error'.)
-  if (sv > bankSize()-12) sv = bankSize()-12;
-  
-  skipBytes(sv);
-  fCurOffsetInFile += sv;
+  fNumHeaderBytesToSkip = sv;
+  skipRemainingHeaderBytes(False);
 }
 
+void MatroskaFileParser::skipRemainingHeaderBytes(Boolean isContinuation) {
+  if (fNumHeaderBytesToSkip == 0) return; // common case
+
+  // Hack: To avoid tripping into a parser 'internal error' if we try to skip an excessively large
+  // distance, break up the skipping into manageable chunks, to ensure forward progress:
+  unsigned const maxBytesToSkip = bankSize();
+  while (fNumHeaderBytesToSkip > 0) {
+    unsigned numBytesToSkipNow
+      = fNumHeaderBytesToSkip < maxBytesToSkip ? (unsigned)fNumHeaderBytesToSkip : maxBytesToSkip;
+    setParseState();
+    skipBytes(numBytesToSkipNow);
+#ifdef DEBUG
+    if (isContinuation || numBytesToSkipNow < fNumHeaderBytesToSkip) {
+      fprintf(stderr, "\t\t(skipped %u bytes; %llu bytes remaining)\n",
+	      numBytesToSkipNow, fNumHeaderBytesToSkip - numBytesToSkipNow);
+    }
+#endif
+    fCurOffsetInFile += numBytesToSkipNow;
+    fNumHeaderBytesToSkip -= numBytesToSkipNow;
+  }
+}
+      
 void MatroskaFileParser::setParseState() {
   fSavedCurOffsetInFile = fCurOffsetInFile;
   fSavedCurOffsetWithinFrame = fCurOffsetWithinFrame;

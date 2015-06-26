@@ -13,7 +13,7 @@ You should have received a copy of the GNU Lesser General Public License
 along with this library; if not, write to the Free Software Foundation, Inc.,
 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 **********/
-// Copyright (c) 1996-2013, Live Networks, Inc.  All rights reserved
+// Copyright (c) 1996-2015, Live Networks, Inc.  All rights reserved
 // A common framework, used for the "openRTSP" and "playSIP" applications
 // Interfaces
 
@@ -36,6 +36,8 @@ extern void startPlayingSession(MediaSession* session, char const* absStartTime,
   // For playing by 'absolute' time (using strings of the form "YYYYMMDDTHHMMSSZ" or "YYYYMMDDTHHMMSS.<frac>Z"
 
 extern void tearDownSession(MediaSession* session, RTSPClient::responseHandler* afterFunc);
+
+extern void setUserAgentString(char const* userAgentString);
 
 extern Authenticator* ourAuthenticator;
 extern Boolean allowProxyServers;
